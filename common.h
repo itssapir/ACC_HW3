@@ -49,6 +49,7 @@ struct rpc_request
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define QSIZE 10
+#define DONEJOB -1
 typedef struct jobS* pJobS;
 typedef struct jobS {
     uchar job[SQR(IMG_DIMENSION)];

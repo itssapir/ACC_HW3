@@ -226,7 +226,7 @@ struct server_context {
     /* TODO: add pointers and memory region(s) for CPU-GPU queues */
     struct ibv_mr *mr_in_queues; /* Memory region for in queues */
     struct ibv_mr *mr_out_queues; /* Memory region for out queues */
-    Q *QinDev,*QoutDev,*QinHost,*QcpuHost;
+    Q *QinDev,*QoutDev,*QinHost,*QoutHost;
     unsigned int tblocks;
 };
 
@@ -646,7 +646,7 @@ int main(int argc, char *argv[]) {
     if (ctx.mode == MODE_QUEUE) {
         /* TODO run the GPU persistent kernel from hw2, for 1024 threads per block */
         unsigned int tblocks = getTBlocksAmnt(1024, 2*4*256+256);
-        gpu_process_image_pc<<tblocks,1024>>(ctx.QinDev,ctx.QoutDev);
+        gpu_process_image_pc<<<tblocks,1024>>>(ctx.QinDev,ctx.QoutDev);
     }
 
     /* now finally we get to the actual work, in the event loop */
