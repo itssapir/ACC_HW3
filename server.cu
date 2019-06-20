@@ -101,8 +101,101 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
-/* TODO: copy queue-based GPU kernel from hw2 */
-/* TODO: end */
+#define QSIZE 10
+typedef struct jobS* pJobS;
+typedef struct jobS {
+    uchar job[SQR(IMG_DIMENSION)];
+    int jobId;
+} jobS;
+
+typedef struct singleQ {
+    jobS jobs[QSIZE];
+    int head;
+    int tail;
+} Q;
+
+unsigned int getTBlocksAmnt(int threadsPerBlock, int shmemPerBlock) {
+    struct cudaDeviceProp props;
+    CUDA_CHECK( cudaGetDeviceProperties(&props, 0) );
+    int  ThreadsPerSM = min(props.maxThreadsPerMultiProcessor, props.regsPerMultiprocessor/32);
+    int  SMCount = props.multiProcessorCount;
+    size_t  shmemPerSM = props.sharedMemPerMultiprocessor;
+    return SMCount * min( ThreadsPerSM/threadsPerBlock, (unsigned int)shmemPerSM/shmemPerBlock);
+}
+
+__global__ void gpu_process_image_pc(volatile void* in,volatile void* out) {
+    __shared__ int histogram[256];
+    __shared__ int hist_min[256];
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    uchar * jobQptr;
+    int currJobId;
+    Q *inQ = (Q*)in, *outQ = (Q*)out;
+    inQ += bid;
+    outQ += bid;
+    while (true) {
+        __threadfence();
+        while(inQ->tail >= inQ->head) __threadfence_system(); // wait for queue to contain a job
+        //save the job ptr and the job id
+        jobQptr = inQ->jobs[inQ->tail % QSIZE].job;
+        currJobId = inQ->jobs[inQ->tail % QSIZE].jobId;
+        if(currJobId == DONEJOB) {
+            __threadfence();
+            return;
+        }
+        /*----------------------------------------------------------------------------*/
+        /*do here the copy*/
+        //
+        //
+        //do the calcs
+
+        __threadfence();
+
+        if (tid < 256) {
+            histogram[tid] = 0;
+        }
+        __syncthreads();
+    
+        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
+        {
+            __threadfence_system(); // needed to get currect image data
+            atomicAdd(&histogram[jobQptr[i]], 1);
+        }
+    
+        __syncthreads();
+    
+        prefix_sum(histogram, 256);
+    
+        if (tid < 256) {
+            hist_min[tid] = histogram[tid];
+        }
+        __syncthreads();
+    
+        int cdf_min = arr_min(hist_min, 256);
+    
+        __shared__ uchar map[256];
+        if (tid < 256) {
+            int map_value = (float)(histogram[tid] - cdf_min) / (SQR(IMG_DIMENSION) - cdf_min) * 255;
+            map[tid] = (uchar)map_value;
+        }
+    
+        __syncthreads();
+        while(!(outQ->head - outQ->tail < QSIZE)) __threadfence_system();
+        for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x) {
+            outQ->jobs[outQ->head % QSIZE].job[i] = map[jobQptr[i]];
+        }
+        outQ->jobs[outQ->head % QSIZE].jobId = currJobId; 
+        __threadfence_system();
+        // try to catch free cell in Qout and copy the result
+        if (tid == 0){
+            //save the job-out ptr and insert the job id
+            outQ->head ++;
+            inQ->tail ++;
+            // printf("GPU: sent job #%d\n",currJobId);
+        }
+        __threadfence_system();
+    }
+}
 
 void process_image_on_gpu(uchar *img_in, uchar *img_out)
 {
@@ -144,7 +237,10 @@ struct server_context {
     struct ibv_mr *mr_images_in; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
     /* TODO: add pointers and memory region(s) for CPU-GPU queues */
-    
+    struct ibv_mr *mr_in_queues; /* Memory region for in queues */
+    struct ibv_mr *mr_out_queues; /* Memory region for out queues */
+    Q *QinDev,*QoutDev,*QinHost,*QcpuHost;
+    unsigned int tblocks;
 };
 
 void allocate_memory(server_context *ctx)
@@ -154,6 +250,18 @@ void allocate_memory(server_context *ctx)
     ctx->requests = (rpc_request *)calloc(OUTSTANDING_REQUESTS, sizeof(rpc_request));
 
     /* TODO take CPU-GPU stream allocation code from hw2 */
+    unsigned int tblocks = getTBlocksAmnt(1024, 2*4*256+256);
+    ctx->tblocks = tblocks;
+    // allocate the queues in CPU memory
+    CUDA_CHECK( cudaHostAlloc(&ctx->QinHost, sizeof(Q)*tblocks , 0) );
+    CUDA_CHECK( cudaHostAlloc(&ctx->QoutHost, sizeof(Q)*tblocks , 0) );
+    // init memory to 0's
+    memset(ctx->QinHost, 0, sizeof(Q)*tblocks);
+    memset(ctx->QoutHost, 0, sizeof(Q)*tblocks);
+    // get a pointer for the GPU to use
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->QinDev, ctx->QinHost, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->QoutDev, ctx->QoutHost, 0) );
+
 }
 
 void tcp_connection(server_context *ctx)
@@ -530,6 +638,8 @@ int main(int argc, char *argv[]) {
 
     if (ctx.mode == MODE_QUEUE) {
         /* TODO run the GPU persistent kernel from hw2, for 1024 threads per block */
+        unsigned int tblocks = getTBlocksAmnt(1024, 2*4*256+256);
+        gpu_process_image_pc<<tblocks,1024>>(ctx.QinDev,ctx.QoutDev);
     }
 
     /* now finally we get to the actual work, in the event loop */
