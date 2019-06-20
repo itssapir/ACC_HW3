@@ -103,6 +103,8 @@ struct client_context {
     uchar *images_out_from_gpu;
 
     /* TODO add necessary context to track the client side of the GPU's producer/consumer queues */
+    struct ibv_mr *mr_queue_info;
+    void* queue_info_buff;
 };
 
 void rpc_call(struct client_context *ctx,
@@ -395,6 +397,33 @@ void allocate_and_register_memory(struct client_context *ctx)
         perror("Unable to create MR for sends");
         exit(1);
     }
+
+    /* GPU-CPU queue mode */
+    ctx->queue_info_buff = (Q*)malloc(sizeof(Q));
+    ctx->mr_queue_info = ibv_reg_mr( ctx->pd, ctx->queue_info_buff, sizeof(Q), IBV_ACCESS_LOCAL_WRITE)
+}
+
+void rd_read(struct client_context *ctx, unsigned block, unsigned offset, unsigned size)
+{
+    struct ibv_sge sg;
+    struct ibv_send_wr wr, *bad_wr;
+    memset(&wr, 0, sizeof(wr) );
+    sg.addr = (uint64_t)(ctx->queue_info_buff+offset);
+    sg.length = size;
+    sg.lkey = ctx->mr_queue_info->lkey;
+
+    //TODO: do we need to set wr.wr_id ?
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.wr.rdma.remote_addr = ctx->server_info.outQaddr + block*sizeof(Q)+ offset;
+    wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
+
+    if(ibv_post_send(ctx->qp, &wr, &bad_wr) ) {
+                printf("ERROR: ibv_post_send() failed\n");
+                exit(1);
+    }
+
 }
 
 void process_images(struct client_context *ctx)
@@ -424,7 +453,8 @@ void process_images(struct client_context *ctx)
         }
     } else {
         /* TODO use the queues implementation from homework 2 using RDMA */
-
+        struct ibv_sge sge;
+        struct ibv_send_wr wr;
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
