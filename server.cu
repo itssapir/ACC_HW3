@@ -101,19 +101,6 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
-#define QSIZE 10
-typedef struct jobS* pJobS;
-typedef struct jobS {
-    uchar job[SQR(IMG_DIMENSION)];
-    int jobId;
-} jobS;
-
-typedef struct singleQ {
-    jobS jobs[QSIZE];
-    int head;
-    int tail;
-} Q;
-
 unsigned int getTBlocksAmnt(int threadsPerBlock, int shmemPerBlock) {
     struct cudaDeviceProp props;
     CUDA_CHECK( cudaGetDeviceProperties(&props, 0) );
@@ -253,11 +240,11 @@ void allocate_memory(server_context *ctx)
     unsigned int tblocks = getTBlocksAmnt(1024, 2*4*256+256);
     ctx->tblocks = tblocks;
     // allocate the queues in CPU memory
-    CUDA_CHECK( cudaHostAlloc(&ctx->QinHost, sizeof(Q)*tblocks , 0) );
-    CUDA_CHECK( cudaHostAlloc(&ctx->QoutHost, sizeof(Q)*tblocks , 0) );
+    CUDA_CHECK( cudaHostAlloc(&ctx->QinHost, sizeof(Q)*ctx->tblocks , 0) );
+    CUDA_CHECK( cudaHostAlloc(&ctx->QoutHost, sizeof(Q)*ctx->tblocks , 0) );
     // init memory to 0's
-    memset(ctx->QinHost, 0, sizeof(Q)*tblocks);
-    memset(ctx->QoutHost, 0, sizeof(Q)*tblocks);
+    memset(ctx->QinHost, 0, sizeof(Q)*ctx->tblocks);
+    memset(ctx->QoutHost, 0, sizeof(Q)*ctx->tblocks);
     // get a pointer for the GPU to use
     CUDA_CHECK( cudaHostGetDevicePointer(&ctx->QinDev, ctx->QinHost, 0) );
     CUDA_CHECK( cudaHostGetDevicePointer(&ctx->QoutDev, ctx->QoutHost, 0) );
@@ -342,6 +329,16 @@ void initialize_verbs(server_context *ctx)
     }
 
     /* TODO register additional memory regions for CPU-GPU queues */
+    ctx->mr_in_queues = ibv_reg_mr(ctx->pd, ctx->QinHost, sizeof(Q)*ctx->tblocks, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_in_queues) {
+        printf("ibv_reg_mr() failed for in queue\n"); // TODO REMOVE
+        exit(1);
+    }
+    ctx->mr_out_queues = ibv_reg_mr(ctx->pd, ctx->QoutHost, sizeof(Q)*ctx->tblocks, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_images_out) {
+        printf("ibv_reg_mr() failed for out queue\n"); // TODO REMOVE
+        exit(1);
+    }
 
     /* create completion queue (CQ). We'll use same CQ for both send and receive parts of the QP */
     ctx->cq = ibv_create_cq(ctx->context, 2 * OUTSTANDING_REQUESTS, NULL, NULL, 0); /* create a CQ with place for two completions per request */
@@ -387,6 +384,11 @@ void exchange_parameters(server_context *ctx, ib_info_t *client_info)
     my_info.lid = port_attr.lid;
     my_info.qpn = ctx->qp->qp_num;
     /* TODO add additional server rkeys / addresses here if needed */
+    my_info.tblocks = ctx->tblocks;
+    my_info.inQaddr = ctx->mr_in_queues->addr;
+    my_info.outQaddr = ctx->mr_out_queues->addr;
+    my_info.rkeyIn = ctx->mr_in_queues->rkey;
+    my_info.rkeyOut = ctx->mr_out_queues->rkey;
 
     ret = send(ctx->socket_fd, &my_info, sizeof(struct ib_info_t), 0);
     if (ret < 0) {
@@ -607,6 +609,11 @@ void teardown_context(server_context *ctx)
     ibv_dereg_mr(ctx->mr_images_in);
     ibv_dereg_mr(ctx->mr_images_out);
     /* TODO destroy the additional server MRs here if needed */
+    ibv_dereg_mr(ctx->mr_in_queues);
+    ibv_dereg_mr(ctx->mr_out_queues);
+    CUDA_CHECK( cudaFreeHost(ctx->QinHost) );
+    CUDA_CHECK( cudaFreeHost(ctx->QoutHost) );
+
     ibv_dealloc_pd(ctx->pd);
     ibv_close_device(ctx->context);
 }

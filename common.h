@@ -48,12 +48,28 @@ struct rpc_request
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define QSIZE 10
+typedef struct jobS* pJobS;
+typedef struct jobS {
+    uchar job[SQR(IMG_DIMENSION)];
+    int jobId;
+} jobS;
+
+typedef struct singleQ {
+    jobS jobs[QSIZE];
+    int head;
+    int tail;
+} Q;
+
+
 struct ib_info_t {
     int lid;
     int qpn;
     /* TODO add additional server rkeys / addresses here if needed */
-
+    void *inQaddr, *outQaddr;
+    uint32_t rkeyIn, rkeyOut;
     /* TODO communicate number of queues / blocks, other information needed to operate the GPU queues remotely */
+    unsigned int tblocks;
 
 };
 
