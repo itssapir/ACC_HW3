@@ -5,7 +5,13 @@
 
 # vim swp files
 *.swp
+client
+client.o
+common.o
+server
+server.o
 
+no changes added to commit (use "git add" and/or "git commit -a")
 # User-specific files
 *.suo
 *.user
