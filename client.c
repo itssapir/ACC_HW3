@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include "common.h"
+#include <stddef.h>
 
 #define NREQUESTS 10000
 
@@ -103,8 +104,9 @@ struct client_context {
     uchar *images_out_from_gpu;
 
     /* TODO add necessary context to track the client side of the GPU's producer/consumer queues */
-    struct ibv_mr *mr_queue_info;
-    void* queue_info_buff;
+    struct ibv_mr *mr_queue_info, *mr_job_buff;
+    unsigned int queue_info_buff[2];
+    jobS job_buff;
 };
 
 void rpc_call(struct client_context *ctx,
@@ -364,6 +366,12 @@ void teardown_connection(struct client_context *ctx) {
         ibv_dereg_mr(ctx->mr_images_in);
         ibv_dereg_mr(ctx->mr_images_out);
     }
+    if (ctx->mode == MODE_QUEUE) {
+        ibv_dereg_mr(ctx->mr_images_in);
+        ibv_dereg_mr(ctx->mr_images_out);
+        ibv_dereg_mr(ctx->mr_job_buff);
+        ibv_dereg_mr(ctx->mr_queue_info);
+    }
     ibv_dereg_mr(ctx->mr_requests);
     ibv_destroy_qp(ctx->qp);
     ibv_destroy_cq(ctx->cq);
@@ -399,31 +407,206 @@ void allocate_and_register_memory(struct client_context *ctx)
     }
 
     /* GPU-CPU queue mode */
-    ctx->queue_info_buff = (Q*)malloc(sizeof(Q));
-    ctx->mr_queue_info = ibv_reg_mr( ctx->pd, ctx->queue_info_buff, sizeof(Q), IBV_ACCESS_LOCAL_WRITE)
+    ctx->mr_queue_info = ibv_reg_mr( ctx->pd, ctx->queue_info_buff, 2*sizeof(unsigned int), IBV_ACCESS_LOCAL_WRITE);
+    ctx->mr_job_buff = ibv_reg_mr( ctx->pd, &ctx->job_buff, sizeof(jobS), IBV_ACCESS_LOCAL_WRITE);
 }
 
-void rd_read(struct client_context *ctx, unsigned block, unsigned offset, unsigned size)
-{
+enum TYPE {OUT,IN};
+
+void increase_q(struct client_context *ctx, unsigned block, unsigned current, TYPE type ) {
+    // set the data to send ( we will send from the first cell regardless if it is head or tail, for comfort
+    ctx->queue_info_buff[0] = current + 1;
+
+    // prepare the write process
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
-    memset(&wr, 0, sizeof(wr) );
-    sg.addr = (uint64_t)(ctx->queue_info_buff+offset);
-    sg.length = size;
+    memset(&sg, 0, sizeof(struct ibv_sge));
+    memset(&wr, 0, sizeof(struct ibv_send_wr));
+    sg.addr = (uintptr_t)(ctx->queue_info_buff);
+    sg.length = sizeof(unsigned int);
+    sg.lkey = ctx->mr_queue_info->lkey;
+
+    //TODO: do we need to set wr.wr_id ?
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
+    if( type == OUT ) { // need to increase tail of out queue
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.outQaddr + block*sizeof(Q)+ offsetof(Q,tail);
+        wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
+    }
+    else { // need to increase head of in queue
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q)+ offsetof(Q,head);
+        wr.wr.rdma.rkey = ctx->server_info.rkeyIn;
+    }
+
+    // send WQE
+    if(ibv_post_send(ctx->qp, &wr, &bad_wr) ) {
+                printf("ERROR: ibv_post_send() failed\n");
+                exit(1);
+    }
+
+    // wait for CQE
+    int ncqes;
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
+}
+
+void read_info(struct client_context *ctx, unsigned block, TYPE rdType ) {
+    struct ibv_sge sg;
+    struct ibv_send_wr wr, *bad_wr;
+    memset(&sg, 0, sizeof(struct ibv_sge));
+    memset(&wr, 0, sizeof(struct ibv_send_wr));
+    sg.addr = (uintptr_t)(ctx->queue_info_buff);
+    sg.length = 2*sizeof(unsigned int);
     sg.lkey = ctx->mr_queue_info->lkey;
 
     //TODO: do we need to set wr.wr_id ?
     wr.sg_list = &sg;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
-    wr.wr.rdma.remote_addr = ctx->server_info.outQaddr + block*sizeof(Q)+ offset;
-    wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
+    wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
+    if( rdType == OUT ) {
+        // TODO: make sure we get the head and tail currectly this way
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.outQaddr + block*sizeof(Q)+ offsetof(Q,head);
+        wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
+    }
+    else { // need to read the in queue
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q)+ offsetof(Q,head);
+        wr.wr.rdma.rkey = ctx->server_info.rkeyIn;
+    }
 
+    // send WQE
     if(ibv_post_send(ctx->qp, &wr, &bad_wr) ) {
                 printf("ERROR: ibv_post_send() failed\n");
                 exit(1);
     }
 
+    // wait for CQE
+    int ncqes;
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
+}
+
+// this puts the completed job directly into it's place in images_out_from_gpu
+// tail should be sent in bounds ( % QSIZE)
+void receive_job(struct client_context *ctx, unsigned block, unsigned tail) {
+    assert( tail < QSIZE );
+    struct ibv_sge sg;
+    struct ibv_send_wr wr, *bad_wr;
+    memset(&sg, 0, sizeof(struct ibv_sge));
+    memset(&wr, 0, sizeof(struct ibv_send_wr));
+    sg.addr = (uintptr_t)(&ctx->job_buff);
+    sg.length = sizeof(jobS);
+    sg.lkey = ctx->mr_job_buff->lkey;
+
+    //TODO: do we need to set wr.wr_id ?
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
+    wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.outQaddr + block*sizeof(Q) + offsetof(Q,jobs) + tail*sizeof(jobS);
+    wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
+
+    // send WQE
+    if(ibv_post_send(ctx->qp, &wr, &bad_wr) ) {
+                printf("ERROR: ibv_post_send() failed\n");
+                exit(1);
+    }
+
+    // wait for CQE
+    int ncqes;
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
+    // now copy job to currect output place
+    unsigned jobId = ctx->job_buff.jobId;
+    memcpy( &ctx->images_out_from_gpu[jobId * SQR(IMG_DIMENSION)], ctx->job_buff.job , SQR(IMG_DIMENSION) );
+}
+
+// this sends the job directly from images_in to the remote GPU
+// head should be sent in bounds ( % QSIZE)
+void send_job(struct client_context *ctx, unsigned block, unsigned head, int jobId) {
+    assert( head < QSIZE );
+    // prepare job_buff with the job to send
+    if(jobId != DONEJOB) { // -1 means end job, dont need to send a full job
+        memcpy( ctx->job_buff.job, &ctx->images_in[jobId * SQR(IMG_DIMENSION)], SQR(IMG_DIMENSION) );
+    }
+    ctx->job_buff.jobId = jobId;
+
+    // start the send process
+    struct ibv_sge sg;
+    struct ibv_send_wr wr, *bad_wr;
+    memset(&sg, 0, sizeof(struct ibv_sge));
+    memset(&wr, 0, sizeof(struct ibv_send_wr));
+    if(jobId != DONEJOB) {
+        sg.addr = (uintptr_t)(&ctx->job_buff);
+        sg.length = sizeof(jobS);
+    }
+    else {
+        sg.addr = (uintptr_t)(&ctx->job_buff.jobId);
+        sg.length = sizeof(int);
+    }
+    sg.lkey = ctx->mr_job_buff->lkey;
+
+    //TODO: do we need to set wr.wr_id ?
+    wr.sg_list = &sg;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
+    if(jobId != DONEJOB) {
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobs);
+    }
+    else {
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobs) + offsetof(jobS,jobId);
+    }
+    wr.wr.rdma.rkey = ctx->server_info.rkeyIn;
+
+    // send WQE
+    if(ibv_post_send(ctx->qp, &wr, &bad_wr) ) {
+                printf("ERROR: ibv_post_send() failed\n");
+                exit(1);
+    }
+
+    // wait for CQE
+    int ncqes;
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
 }
 
 void process_images(struct client_context *ctx)
@@ -453,16 +636,75 @@ void process_images(struct client_context *ctx)
         }
     } else {
         /* TODO use the queues implementation from homework 2 using RDMA */
-        struct ibv_sge sge;
-        struct ibv_send_wr wr;
+        unsigned amntRecv = 0;
+        unsigned nextIns = 0;
+        unsigned head,tail;
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             /* TODO check producer consumer queue for any responses.
              * don't block. if no responses are there we'll check again in the next iteration
              */
+            for (int block = 0; block < ctx->server_info.tblocks; ++block) {
+                read_info(ctx, block, OUT);
+                head = ctx->queue_info_buff[0], tail = ctx->queue_info_buff[1];
+                while ( tail < head ) {
+                    receive_job(ctx, block, tail % QSIZE);
+                    ++amntRecv;
+                    increase_q(ctx, block, tail, OUT);
+                    read_info(ctx, block, OUT); // TODO REMOVE, checking correctness
+                    assert( ctx->queue_info_buff[1] == tail + 1 );
+                    ++tail;
+                }
+            }
 
             /* TODO push task to queue */
+            // find a queue with a free slot to send job to
+            int blockToUse;
+            bool failed = true;
+            for (int block = 0; block < ctx->server_info.tblocks; ++block) {
+                blockToUse = ( block + nextIns ) % ctx->server_info.tblocks;
+                read_info(ctx, blockToUse, IN);
+                head = ctx->queue_info_buff[0], tail = ctx->queue_info_buff[1];
+                if( tail + QSIZE <= head )
+                    continue;
+                failed = false;
+                break;
+            }
+            if (failed) {
+                --img_idx;
+                continue;
+            }
+
+            // blockToUse has a spot in its in queue
+            send_job(ctx, blockToUse, head % QSIZE, img_idx);
+            increase_q(ctx, blockToUse, head, IN);
+            ++nextIns;
         }
         /* TODO wait until you have responses for all requests */
+        // firstly, signal all threads to finish and stop
+        for(int block = 0; block < ctx->server_info.tblocks; ++block) {
+            do {
+                read_info(ctx, block, IN);
+                head = ctx->queue_info_buff[0], tail = ctx->queue_info_buff[1];
+            } while( tail + QSIZE <= head );
+            // send done message to block
+            send_job(ctx, block, head % QSIZE, DONEJOB);
+            increase_q(ctx, block, head, IN);
+        }
+        // done signaling all queues, now we need to wait for all the images to arrive
+        while(amntRecv < NREQUESTS) {
+            for(int block = 0; block < ctx->server_info.tblocks; ++block) {
+                read_info(ctx, block, OUT);
+                head = ctx->queue_info_buff[0], tail = ctx->queue_info_buff[1];
+                while( tail < head ) {
+                    receive_job(ctx, block, tail % QSIZE);
+                    ++amntRecv;
+                    increase_q(ctx, block, tail, OUT);
+                    read_info(ctx, block, OUT); // TODO REMOVE, checking correctness
+                    assert( ctx->queue_info_buff[1] == tail + 1 );
+                    ++tail;
+                }
+            }
+        }
     }
 
     double tf = get_time_msec();
