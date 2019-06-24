@@ -428,7 +428,6 @@ void increase_q(struct client_context *ctx, unsigned block, unsigned current, TY
     sg.length = sizeof(unsigned int);
     sg.lkey = ctx->mr_queue_info->lkey;
 
-    //TODO: do we need to set wr.wr_id ?
     wr.sg_list = &sg;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE;
@@ -473,13 +472,11 @@ void read_info(struct client_context *ctx, unsigned block, TYPE rdType ) {
     sg.length = 2*sizeof(unsigned int);
     sg.lkey = ctx->mr_queue_info->lkey;
 
-    //TODO: do we need to set wr.wr_id ?
     wr.sg_list = &sg;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
     wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
     if( rdType == OUT ) {
-        // TODO: make sure we get the head and tail currectly this way
         wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.outQaddr + block*sizeof(Q)+ offsetof(Q,head);
         wr.wr.rdma.rkey = ctx->server_info.rkeyOut;
     }
@@ -522,7 +519,6 @@ void receive_job(struct client_context *ctx, unsigned block, unsigned tail) {
     sg.length = sizeof(jobS);
     sg.lkey = ctx->mr_job_buff->lkey;
 
-    //TODO: do we need to set wr.wr_id ?
     wr.sg_list = &sg;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_READ;
@@ -580,7 +576,6 @@ void send_job(struct client_context *ctx, unsigned block, unsigned head, int job
     }
     sg.lkey = ctx->mr_job_buff->lkey;
 
-    //TODO: do we need to set wr.wr_id ?
     wr.sg_list = &sg;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE;
@@ -655,8 +650,6 @@ void process_images(struct client_context *ctx)
                     receive_job(ctx, block, tail % QSIZE);
                     ++amntRecv;
                     increase_q(ctx, block, tail, OUT);
-                    read_info(ctx, block, OUT); // TODO REMOVE, checking correctness
-                    assert( ctx->queue_info_buff[1] == tail + 1 );
                     ++tail;
                 }
             }
@@ -704,8 +697,6 @@ void process_images(struct client_context *ctx)
                     receive_job(ctx, block, tail % QSIZE);
                     ++amntRecv;
                     increase_q(ctx, block, tail, OUT);
-                    read_info(ctx, block, OUT); // TODO REMOVE, checking correctness
-                    assert( ctx->queue_info_buff[1] == tail + 1 );
                     ++tail;
                 }
             }
