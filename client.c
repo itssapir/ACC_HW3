@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include "common.h"
 #include <stddef.h>
+#include <stdbool.h>
 
 #define NREQUESTS 10000
 
@@ -411,7 +412,7 @@ void allocate_and_register_memory(struct client_context *ctx)
     ctx->mr_job_buff = ibv_reg_mr( ctx->pd, &ctx->job_buff, sizeof(jobS), IBV_ACCESS_LOCAL_WRITE);
 }
 
-enum TYPE {OUT,IN};
+typedef enum TYPE {OUT,IN} TYPE;
 
 void increase_q(struct client_context *ctx, unsigned block, unsigned current, TYPE type ) {
     // set the data to send ( we will send from the first cell regardless if it is head or tail, for comfort
@@ -420,6 +421,7 @@ void increase_q(struct client_context *ctx, unsigned block, unsigned current, TY
     // prepare the write process
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
+    struct ibv_wc wc; /* CQE */
     memset(&sg, 0, sizeof(struct ibv_sge));
     memset(&wr, 0, sizeof(struct ibv_send_wr));
     sg.addr = (uintptr_t)(ctx->queue_info_buff);
@@ -464,6 +466,7 @@ void increase_q(struct client_context *ctx, unsigned block, unsigned current, TY
 void read_info(struct client_context *ctx, unsigned block, TYPE rdType ) {
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
+    struct ibv_wc wc; /* CQE */
     memset(&sg, 0, sizeof(struct ibv_sge));
     memset(&wr, 0, sizeof(struct ibv_send_wr));
     sg.addr = (uintptr_t)(ctx->queue_info_buff);
@@ -512,6 +515,7 @@ void receive_job(struct client_context *ctx, unsigned block, unsigned tail) {
     assert( tail < QSIZE );
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
+    struct ibv_wc wc; /* CQE */
     memset(&sg, 0, sizeof(struct ibv_sge));
     memset(&wr, 0, sizeof(struct ibv_send_wr));
     sg.addr = (uintptr_t)(&ctx->job_buff);
@@ -563,6 +567,7 @@ void send_job(struct client_context *ctx, unsigned block, unsigned head, int job
     // start the send process
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
+    struct ibv_wc wc; /* CQE */
     memset(&sg, 0, sizeof(struct ibv_sge));
     memset(&wr, 0, sizeof(struct ibv_send_wr));
     if(jobId != DONEJOB) {
@@ -581,10 +586,10 @@ void send_job(struct client_context *ctx, unsigned block, unsigned head, int job
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.send_flags = IBV_SEND_SIGNALED; /* always set this in this excersize. generates CQE */
     if(jobId != DONEJOB) {
-        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobs);
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobS);
     }
     else {
-        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobs) + offsetof(jobS,jobId);
+        wr.wr.rdma.remote_addr = (uintptr_t)ctx->server_info.inQaddr + block*sizeof(Q) + offsetof(Q,jobs) + head*sizeof(jobS) + offsetof(jobS,jobId);
     }
     wr.wr.rdma.rkey = ctx->server_info.rkeyIn;
 
