@@ -414,6 +414,8 @@ void allocate_and_register_memory(struct client_context *ctx)
 
 typedef enum TYPE {OUT,IN} TYPE;
 
+
+// increase the in/out queue head/tail (accordingly) to value of current+1
 void increase_q(struct client_context *ctx, unsigned block, unsigned current, TYPE type ) {
     // set the data to send ( we will send from the first cell regardless if it is head or tail, for comfort
     ctx->queue_info_buff[0] = current + 1;
@@ -462,6 +464,7 @@ void increase_q(struct client_context *ctx, unsigned block, unsigned current, TY
     }
 }
 
+// read the info (head+tail) of in/out queue of the relevant T.B 
 void read_info(struct client_context *ctx, unsigned block, TYPE rdType ) {
     struct ibv_sge sg;
     struct ibv_send_wr wr, *bad_wr;
